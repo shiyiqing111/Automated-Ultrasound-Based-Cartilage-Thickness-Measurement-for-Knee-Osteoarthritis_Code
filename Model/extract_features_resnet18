@@ -1,0 +1,63 @@
+from config import *
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from utils.features import extract_embeddings
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import joblib
+
+def extract_and_save_features(apply_pca=True, pca_var=0.9):
+    print("=== Step 1: Extract ResNet18 Embeddings ===")
+
+    df_label = pd.read_excel(LABELED_EXCEL)
+    all_imgs = [p for p in IMAGES_DIR.glob("*") if p.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+
+    set_label = set(df_label["Filename"].astype(str).str.strip())
+    set_all = set(p.stem for p in all_imgs)
+    set_unlabel = set_all - set_label
+
+    train_imgs = [p for p in all_imgs if p.stem in set_label]
+    test_imgs  = [p for p in all_imgs if p.stem in set_unlabel]
+
+    print(f"Labeled: {len(train_imgs)} | Unlabeled: {len(test_imgs)}")
+
+    idx_train, X_train = extract_embeddings(train_imgs, backbone_name="resnet18", cache_dir=EMBED_CACHE_DIR)
+    idx_test,  X_test  = extract_embeddings(test_imgs,  backbone_name="resnet18", cache_dir=EMBED_CACHE_DIR)
+    print(f"[DEBUG] Original feature dimension: {X_train.shape}")
+
+    # ====== Step 2: standardization ======
+    print("🔹 Applying StandardScaler normalization...")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled  = scaler.transform(X_test)
+
+    # ====== Step 3: PCA dimensionality reduction ======
+    if apply_pca:
+        print(f"Applying PCA (Maintain the variance ratio={pca_var:.2f}) ...")
+        pca = PCA(n_components=pca_var, svd_solver='full')
+        X_train_pca = pca.fit_transform(X_train_scaled)
+        X_test_pca  = pca.transform(X_test_scaled)
+        print(f"[INFO] After dimension reduction: {X_train_pca.shape[1]}")
+
+        out_file = Path(RESULT_DIR) / "resnet18_features_pca.npz"
+        np.savez(out_file,
+                 X_train=X_train_pca, X_test=X_test_pca,
+                 train_filenames=[p.stem for p in train_imgs],
+                 test_filenames=[p.stem for p in test_imgs])
+        print(f"PCA features have been saved: {out_file}")
+
+        joblib.dump(scaler, Path(RESULT_DIR) / "scaler.pkl")
+        joblib.dump(pca, Path(RESULT_DIR) / "pca.pkl")
+        print(f"The Scaler and PCA models have been saved to: {RESULT_DIR}")
+
+    else:
+        out_file = Path(RESULT_DIR) / "resnet18_features_scaled.npz"
+        np.savez(out_file,
+                 X_train=X_train_scaled, X_test=X_test_scaled,
+                 train_filenames=[p.stem for p in train_imgs],
+                 test_filenames=[p.stem for p in test_imgs])
+        print(f"Standardized features have been saved: {out_file}")
+
+if __name__ == "__main__":
+    extract_and_save_features(apply_pca=True, pca_var=0.9)

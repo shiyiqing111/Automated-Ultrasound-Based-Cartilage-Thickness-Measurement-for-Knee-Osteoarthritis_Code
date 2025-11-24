@@ -1,0 +1,181 @@
+from config import *
+from models.knn_model import fit_predict_knn
+from models.linear_model import fit_predict_linear
+from models.rf_model import fit_predict_rf
+from models.xgb_model import fit_predict_xgb
+from utils.geometry import seg_lengths_from_coords, apply_linear_correction, apply_geom_post
+import pandas as pd, numpy as np, re
+from pathlib import Path
+from sklearn.model_selection import GridSearchCV
+from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
+import json
+
+print(">>> metrics module loaded (ResNet50 version)")
+
+# ======== Step 1: Load pre-extracted features ========
+feat_path = Path(RESULT_DIR) / "resnet50_features_pca.npz"
+feat_data = np.load(feat_path, allow_pickle=True)
+
+X_train, X_test = feat_data["X_train"], feat_data["X_test"]
+train_files, test_files = feat_data["train_filenames"], feat_data["test_filenames"]
+
+df_label = pd.read_excel(LABELED_EXCEL)
+Y_train = df_label[
+    ["x1","y1","x2","y2","x3","y3","x4","y4","x5","y5","x6","y6"]
+].values
+
+print(f"Loaded ResNet50 features: X_train={X_train.shape}, X_test={X_test.shape}")
+
+# ======== Step 2: Model List ========
+models_to_run = {
+    "knn": fit_predict_knn,
+    "linear": fit_predict_linear,
+    "rf": fit_predict_rf,
+    "xgb": fit_predict_xgb,
+}
+
+optimized_params = {}
+
+# ======== Step 3: Multi-model training and prediction (including optimization of RF/XGB parameters) ========
+for model_name, model_func in models_to_run.items():
+    print(f"\n=== Training and Predicting with {model_name.upper()} (ResNet50) ===")
+
+    if model_name in ["rf", "xgb"]:
+        print(f"Performing parameter tuning for {model_name} ...")
+
+        if model_name == "rf":
+            base_model = RandomForestRegressor(random_state=42, n_jobs=-1)
+            param_grid = {
+                "n_estimators": [200, 300],
+                "max_depth": [10, 20],
+                "max_features": ["sqrt"],
+                "min_samples_split": [2, 5],
+            }
+
+        else: 
+            base_model = xgb.XGBRegressor(
+                objective="reg:squarederror",
+                tree_method="hist",
+                random_state=42,
+                n_jobs=-1,
+            )
+            param_grid = {
+                "n_estimators": [200, 300],
+                "max_depth": [6, 8],
+                "learning_rate": [0.05],
+                "subsample": [0.8],
+                "colsample_bytree": [1.0],
+            }
+
+        print("Running GridSearchCV (3-fold)...")
+        sub_idx = min(200, len(X_train))
+        grid = GridSearchCV(
+            base_model,
+            param_grid,
+            cv=3,
+            scoring="neg_mean_absolute_error",
+            n_jobs=-1,
+            verbose=1,
+        )
+        grid.fit(X_train[:sub_idx], Y_train[:sub_idx])
+
+        model = grid.best_estimator_
+        optimized_params[model_name] = grid.best_params_
+        print(f"Best Params for {model_name}: {grid.best_params_}")
+
+        model.fit(X_train, Y_train)
+        Y_pred = model.predict(X_test)
+
+    else:
+        Y_pred, model = model_func(X_train, Y_train, X_test)
+
+    Y_pred_adj = apply_geom_post(Y_pred, df_label)
+
+    df_pred = pd.DataFrame(
+        Y_pred_adj,
+        columns=["x1","y1","x2","y2","x3","y3","x4","y4","x5","y5","x6","y6"]
+    )
+    df_pred.insert(0, "Filename", test_files)
+
+    pred_out = PRED_DIR / f"{model_name}_resnet50_unlabeled_pred.xlsx"
+    df_pred.to_excel(pred_out, index=False)
+    print(f"Saved predictions: {pred_out}")
+
+param_log_path = RESULT_DIR / "best_params_rf_xgb_resnet50.json"
+with open(param_log_path, "w") as f:
+    json.dump(optimized_params, f, indent=4)
+print(f"Saved optimized parameters: {param_log_path}")
+
+
+# ======== Step 4: Evaluate and summarize ========
+book = pd.read_excel(BOOK_EXCEL)
+summary_records = []
+
+def remove_last_index(name): return re.sub(r"(_\d+)$", "", name)
+def match_stage(name):
+    for stage in ["_base","_3","_4","_5"]:
+        if stage in name: return stage
+    return ""
+
+for model_name in models_to_run.keys():
+    pred_out = PRED_DIR / f"{model_name}_resnet50_unlabeled_pred.xlsx"
+    if not pred_out.exists(): continue
+
+    print(f"\n>>> Evaluating {model_name.upper()} (ResNet50)")
+
+    pred_df = pd.read_excel(pred_out).rename(columns={
+        "x1":"seg1_x1","y1":"seg1_y1","x2":"seg1_x2","y2":"seg1_y2",
+        "x3":"seg2_x1","y3":"seg2_y1","x4":"seg2_x2","y4":"seg2_y2",
+        "x5":"seg3_x1","y5":"seg3_y1","x6":"seg3_x2","y6":"seg3_y2"
+    })
+
+    pred_len_px = seg_lengths_from_coords(pred_df)
+    pred_len_cm = apply_linear_correction(pred_len_px * PIXEL_TO_CM)
+    pred_len_cm.columns = ["US_lateral_pred","US_femoral_pred","US_medial_pred"]
+
+    pred_all = pd.concat([pred_df[["Filename"]], pred_len_cm], axis=1)
+    pred_all["GroupID"] = pred_all["Filename"].apply(remove_last_index)
+
+    pred_group = pred_all.groupby("GroupID")[["US_lateral_pred","US_femoral_pred","US_medial_pred"]].mean().reset_index()
+    pred_group["Patient"] = pred_group["GroupID"].str.extract(r"(Abbey_\d+)")[0].str.replace("_"," ")
+    pred_group["Stage"] = pred_group["GroupID"].apply(match_stage)
+
+    for seg in ["lateral","femoral","medial"]:
+        seg_pred, seg_true = [], []
+
+        for _, row in pred_group.iterrows():
+            stage, patient = row["Stage"], row["Patient"]
+            col1 = f"US_{seg}_treat{stage}"
+            col2 = f"US_{seg}_contralateral{stage}"
+
+            if col1 in book.columns:
+                val = book.loc[book["Patient"]==patient, col1]
+            else:
+                val = book.loc[book["Patient"]==patient, col2]
+
+            if len(val)==0 or pd.isna(val.values[0]):
+                continue
+
+            seg_pred.append(row[f"US_{seg}_pred"])
+            seg_true.append(val.values[0])
+
+        if seg_pred:
+            df_seg = pd.DataFrame({"pred":seg_pred,"true":seg_true})
+            mae = np.mean(np.abs(df_seg["pred"]-df_seg["true"]))
+            rmse = np.sqrt(np.mean((df_seg["pred"]-df_seg["true"])**2))
+            r2 = np.corrcoef(df_seg["pred"], df_seg["true"])[0,1]**2
+
+            summary_records.append({
+                "Model":model_name,
+                "Segment":seg,
+                "N":len(df_seg),
+                "MAE":mae,
+                "RMSE":rmse,
+                "R2":r2
+            })
+
+summary_df = pd.DataFrame(summary_records)
+out_file = RESULT_DIR / "all_models_segment_summary_resnet50.xlsx"
+summary_df.to_excel(out_file, index=False)
+print(f"\nSaved ResNet50 performance summary to: {out_file}\n")

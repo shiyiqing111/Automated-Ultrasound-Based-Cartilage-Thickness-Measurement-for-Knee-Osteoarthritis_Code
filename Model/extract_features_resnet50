@@ -1,0 +1,70 @@
+from config import *
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from utils.features import extract_embeddings
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import joblib
+
+def extract_and_save_features_resnet50(apply_pca=True, pca_var=0.9):
+    print("=== Step: Extract ResNet50 Embeddings ===")
+
+    # ====== Load dataset ======
+    df_label = pd.read_excel(LABELED_EXCEL)
+    all_imgs = [p for p in IMAGES_DIR.glob("*") if p.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+
+    set_label = set(df_label["Filename"].astype(str).str.strip())
+    set_all = set(p.stem for p in all_imgs)
+    set_unlabel = set_all - set_label
+
+    train_imgs = [p for p in all_imgs if p.stem in set_label]
+    test_imgs  = [p for p in all_imgs if p.stem in set_unlabel]
+
+    print(f"✅ Labeled: {len(train_imgs)} | Unlabeled: {len(test_imgs)}")
+
+    # ====== Extract ResNet50 embeddings ======
+    idx_train, X_train = extract_embeddings(train_imgs, backbone_name="resnet50", cache_dir=EMBED_CACHE_DIR)
+    idx_test,  X_test  = extract_embeddings(test_imgs,  backbone_name="resnet50", cache_dir=EMBED_CACHE_DIR)
+
+    print(f"[DEBUG] 原始特征维度 (ResNet50): {X_train.shape}")
+
+    # ====== Standardization ======
+    print("🔹 Standardizing features...")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled  = scaler.transform(X_test)
+
+    # ====== PCA ======
+    if apply_pca:
+        print(f"🔹 Applying PCA (保留方差比例={pca_var:.2f}) ...")
+        pca = PCA(n_components=pca_var, svd_solver='full')
+        X_train_pca = pca.fit_transform(X_train_scaled)
+        X_test_pca  = pca.transform(X_test_scaled)
+        print(f"[INFO] 降维后维度: {X_train_pca.shape[1]}")
+
+        # Save PCA features
+        out_file = Path(RESULT_DIR) / "resnet50_features_pca.npz"
+        np.savez(out_file,
+                 X_train=X_train_pca,
+                 X_test=X_test_pca,
+                 train_filenames=np.array([p.stem for p in train_imgs]),
+                 test_filenames=np.array([p.stem for p in test_imgs]))
+        print(f"✅ PCA特征已保存: {out_file}")
+
+        # Save models
+        joblib.dump(scaler, Path(RESULT_DIR) / "scaler_resnet50.pkl")
+        joblib.dump(pca, Path(RESULT_DIR) / "pca_resnet50.pkl")
+        print(f"✅ Scaler 与 PCA 模型已保存（ResNet50）")
+
+    else:
+        out_file = Path(RESULT_DIR) / "resnet50_features_scaled.npz"
+        np.savez(out_file,
+                 X_train=X_train_scaled,
+                 X_test=X_test_scaled,
+                 train_filenames=np.array([p.stem for p in train_imgs]),
+                 test_filenames=np.array([p.stem for p in test_imgs]))
+        print(f"✅ 标准化特征已保存: {out_file}")
+
+if __name__ == "__main__":
+    extract_and_save_features_resnet50(apply_pca=True, pca_var=0.9)

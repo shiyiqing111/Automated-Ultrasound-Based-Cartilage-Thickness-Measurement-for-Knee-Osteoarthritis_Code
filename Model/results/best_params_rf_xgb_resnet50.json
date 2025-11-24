@@ -1,0 +1,15 @@
+{
+    "rf": {
+        "max_depth": 20,
+        "max_features": "sqrt",
+        "min_samples_split": 5,
+        "n_estimators": 300
+    },
+    "xgb": {
+        "colsample_bytree": 1.0,
+        "learning_rate": 0.05,
+        "max_depth": 8,
+        "n_estimators": 300,
+        "subsample": 0.8
+    }
+}
