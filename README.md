@@ -236,3 +236,85 @@ Utility modules:
 - `metrics.py` — MAE, RMSE, R², correlations, and summary tables.
 
 Used broadly across training, prediction, and visualization scripts.
+
+---
+
+### 2.7 `optimization/`
+
+This folder contains additional experiments that refine the baseline keypoint–regression pipeline by
+directly regressing segment-wise cartilage thickness and enforcing physiologically plausible value
+ranges.
+
+Key scripts:
+
+- `seg_length_regression_resnet18_physio.py`  
+- `seg_length_regression_resnet50_physio.py`  
+
+**Goal.**  
+In the main pipeline, the lateral segment showed substantially worse performance than the femoral
+and medial segments: all regressors tended to collapse to an overestimated constant thickness
+(~0.6 cm), while the ground-truth lateral thickness in this cohort was typically around
+0.1–0.2 cm. This was likely due to the high-dimensional keypoint space and the much larger
+absolute scale of the femoral segment. The optimization scripts therefore:
+
+1. Convert the six annotated keypoints into three segment lengths  
+   (lateral, femoral, medial) in pixels and then in centimetres using the global
+   pixel-to-cm factor;  
+2. Train **separate 1D regressors per segment** using the same ResNet-18 / ResNet-50 PCA
+   embeddings as inputs;  
+3. Apply **physiology-informed clipping** to constrain predictions to literature-based
+   cartilage thickness ranges (e.g. ≈0.5–4.0/4.5 mm for femoral trochlear cartilage), so that
+   extreme, non-anatomical values (such as lateral thickness > 5 mm) are removed.
+
+Each script trains three model families per segment:
+
+- Ridge regression (`ridge`)  
+- Random forest regression (`rf`)  
+- Gradient-boosted trees via XGBoost (`xgb`)  
+
+KNN is intentionally not used in this optimization stage, as preliminary tests showed that it was
+more sensitive to noise and feature scaling and did not provide consistent benefits over RF/XGBoost
+while being more expensive at inference time.
+
+**Inputs and outputs.**
+
+- Inputs:
+  - `resnet18_features_pca.npz` / `resnet50_features_pca.npz` (from the main feature-extraction step);  
+  - `annotation_points_summary*.xlsx` (for computing segment lengths);  
+  - `Book2.xlsx` or its merged version (for clinician-measured reference thickness).  
+
+- Outputs:
+  - Per-image predictions with physiologically constrained segment-wise thickness in  
+    `predictions/seg_length_models_physio/` (ResNet-18) and  
+    `predictions/seg_length_models_physio_resnet50/` (ResNet-50);  
+  - Aggregated evaluation tables:
+    - `results/segment_length_models_resnet18_physio.xlsx`  
+    - `results/segment_length_models_resnet50_physio.xlsx`  
+    Each file reports N, MAE, RMSE and R² for every \{segment, model\} combination.
+
+In these experiments, all segments achieve sub-millimetre MAE (≈0.03–0.06 cm), and the lateral
+segment improves markedly compared with the original keypoint-regression results, although R²
+remains modest, indicating limited captured inter-patient variability.
+
+---
+
+### 3. Additional Visualization for Optimization
+
+- `optimization/visualize_segment_length_physio.py`  
+
+This script reads the physiologically constrained summary tables:
+
+- `results/segment_length_models_resnet18_physio.xlsx`  
+- `results/segment_length_models_resnet50_physio.xlsx`
+
+and generates comparison plots for each metric (MAE, RMSE, R²):
+
+- For each model (`ridge`, `rf`, `xgb`), a grouped bar chart showing lateral / femoral / medial
+  performance for **ResNet-18 vs ResNet-50**;  
+- Plots are saved to:
+  - `results/comparison_physio/bars/`
+
+These figures are mainly used in the dissertation to illustrate how segment-wise regression and
+physiological range constraints reduce lateral errors and to compare ResNet-18 and ResNet-50
+backbones under the optimized setting.
+
